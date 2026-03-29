@@ -1,5 +1,7 @@
 obj-m += monitor.o
 
+ccflags-y += -Wno-unused-function
+
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 # If you want host-built workload binaries to run directly inside an Alpine
@@ -14,7 +16,7 @@ all: $(USER_TARGETS) module
 module: monitor.ko
 
 engine: engine.c monitor_ioctl.h
-	gcc -O2 -Wall -Wextra -o engine engine.c -lpthread
+	gcc -O2 -Wall -Wextra -Wno-unused-result -o engine engine.c -lpthread
 
 memory_hog: memory_hog.c
 	gcc -O2 -Wall $(WORKLOAD_LDFLAGS) -o memory_hog memory_hog.c

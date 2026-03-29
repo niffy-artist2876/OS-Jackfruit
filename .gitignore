@@ -1,1 +1,4 @@
-solved
+rootfs-base/
+rootfs-*/
+*.tar.gz
+.vscode
