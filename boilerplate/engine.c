@@ -568,6 +568,8 @@ static void handle_start(supervisor_ctx_t *ctx, control_request_t *req, control_
         return;
     }
 
+    fprintf(stderr, "Received start for %s, spawned pid %d\n", req->container_id, pid);
+
     if(ctx->monitor_fd>=0){
         register_with_monitor(ctx->monitor_fd, req->container_id, pid, req->soft_limit_bytes, req->hard_limit_bytes);
     }
