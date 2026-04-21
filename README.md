@@ -155,6 +155,9 @@ sudo rmmod monitor
 ### Screenshot 7 — Scheduling Experiment
 *Terminal output showing completion times of cpu_hog workloads running at different nice values, demonstrating CFS scheduling behavior.*
 
+*In this case, the workload used was cpu_workload.c because processes in an infinite loop are observable in real-time; they do not exit. This demonstrates CFS scheduling behavior more cleanly.*
+
+
 ![Scheduling](screenshots/screenshot7.png)
 
 
