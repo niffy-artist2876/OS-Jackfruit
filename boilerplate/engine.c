@@ -76,6 +76,7 @@ typedef struct container_record {
     int exit_code;
     int exit_signal;
     char log_path[PATH_MAX];
+    pthread_t producer_thread;
     struct container_record *next;
 } container_record_t;
 
@@ -499,9 +500,15 @@ static void reap_children(supervisor_ctx_t *ctx){
 
 static supervisor_ctx_t *g_ctx = NULL;
 
+/* A flag is all that's safe to set inside a signal handler.
+ * waitpid() and pthread_mutex_lock() are NOT async-signal-safe,
+ * so we must never call reap_children() directly from here.
+ * The main loop checks this flag and does the actual reaping. */
+static volatile sig_atomic_t g_sigchld_pending = 0;
+
 static void sigchld_handler(int sig){
     (void)sig;
-    if(g_ctx) reap_children(g_ctx);
+    g_sigchld_pending = 1;
 }
 
 static void sigterm_handler(int sig){
@@ -509,6 +516,7 @@ static void sigterm_handler(int sig){
     if(g_ctx){
         g_ctx->should_stop = 1;
         close(g_ctx->server_fd);
+        g_ctx->server_fd = -1;  /* prevent double-close in teardown */
     }
 }
 
@@ -595,18 +603,62 @@ static void handle_start(supervisor_ctx_t *ctx, control_request_t *req, control_
 
     pthread_t pthr;
     pthread_create(&pthr, NULL, producer_thread, parg);
-    pthread_detach(pthr);
+    /* Store handle on the record so teardown can join it.
+     * Do NOT detach — we need to join for clean shutdown. */
+    pthread_mutex_lock(&ctx->metadata_lock);
+    container_record_t *r = ctx->containers;
+    while (r && strcmp(r->id, req->container_id) != 0) r = r->next;
+    if (r) r->producer_thread = pthr;
+    pthread_mutex_unlock(&ctx->metadata_lock);
 
     resp->status = 0;
     snprintf(resp->message, sizeof(resp->message), "started pid %d", pid);
     write(client_fd, resp, sizeof(*resp));
-    
+
     if(req->kind == CMD_RUN){
-        int wstatus;
-        waitpid(pid, &wstatus, 0);
-        int code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 128 + WTERMSIG(wstatus);
-        snprintf(resp->message, sizeof(resp->message), "exited %d", code);
-        write(client_fd, resp, sizeof(*resp));
+        /* Poll for this container's exit rather than calling waitpid()
+         * directly.  A direct waitpid() here races with sigchld_handler:
+         * if SIGCHLD fires first, the handler's reap_children() already
+         * consumed the exit status and our waitpid() would return -1/ECHILD.
+         *
+         * Instead we spin (with a short sleep so we don't peg the CPU),
+         * draining any pending SIGCHLD flags each iteration, until
+         * reap_children() has updated this container's state away from
+         * CONTAINER_RUNNING. */
+        while (1) {
+            if (g_sigchld_pending) {
+                g_sigchld_pending = 0;
+                reap_children(ctx);
+            }
+
+            int done = 0;
+            int exit_code = 0;
+            pthread_mutex_lock(&ctx->metadata_lock);
+            container_record_t *c2 = ctx->containers;
+            while (c2) {
+                if (c2->host_pid == pid) {
+                    if (c2->state != CONTAINER_RUNNING &&
+                        c2->state != CONTAINER_STARTING) {
+                        done = 1;
+                        exit_code = (c2->exit_signal != 0)
+                                    ? 128 + c2->exit_signal
+                                    : c2->exit_code;
+                    }
+                    break;
+                }
+                c2 = c2->next;
+            }
+            pthread_mutex_unlock(&ctx->metadata_lock);
+
+            if (done) {
+                snprintf(resp->message, sizeof(resp->message),
+                         "exited %d", exit_code);
+                resp->status = exit_code;
+                write(client_fd, resp, sizeof(*resp));
+                break;
+            }
+            usleep(50000);
+        }
     }
     free(cfg);
 }
@@ -664,9 +716,15 @@ static void handle_stop(supervisor_ctx_t *ctx, control_request_t *req, control_r
             if (c->state == CONTAINER_RUNNING) {
                 c->state = CONTAINER_STOPPED; // set before kill per spec
                 kill(c->host_pid, SIGTERM);
+				usleep(50000);
+
+				if(kill(c->host_pid, 0)==0){
+					kill(c->host_pid, SIGKILL);
+				}
+				
                 resp->status = 0;
                 snprintf(resp->message, sizeof(resp->message),
-                         "sent SIGTERM to %d", c->host_pid);
+                         "successfully stopped %d", c->host_pid);
             } else {
                 resp->status = -1;
                 snprintf(resp->message, sizeof(resp->message),
@@ -774,6 +832,13 @@ static int run_supervisor(const char *rootfs)
 	control_request_t req;
 	control_response_t resp;
 
+	/* Drain any SIGCHLD that arrived since last iteration.
+	 * Safe to call here: we are not holding metadata_lock. */
+	if (g_sigchld_pending) {
+	    g_sigchld_pending = 0;
+	    reap_children(&ctx);
+	}
+
 	client_fd = accept(ctx.server_fd, NULL, NULL);
 	if(client_fd < 0){
 		if(errno == EINTR){
@@ -813,18 +878,66 @@ static int run_supervisor(const char *rootfs)
 	}
 
 	close(client_fd);
-	
-	reap_children(&ctx);
     }
 
-    //todo 5
+    //todo 5 - ordered teardown (Task 6)
+
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+    container_record_t *c = ctx.containers;
+    while (c) {
+        if (c->state == CONTAINER_RUNNING) {
+            c->state = CONTAINER_STOPPED;
+            kill(c->host_pid, SIGTERM);
+        }
+        c = c->next;
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
+    usleep(200000);
+    pthread_mutex_lock(&ctx.metadata_lock);
+    c = ctx.containers;
+    while (c) {
+        if (c->state == CONTAINER_STOPPED && kill(c->host_pid, 0) == 0)
+            kill(c->host_pid, SIGKILL);
+        c = c->next;
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
+    reap_children(&ctx);
+
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+    c = ctx.containers;
+    while (c) {
+        if (c->producer_thread)
+            pthread_join(c->producer_thread, NULL);
+        c = c->next;
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
+
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     pthread_join(ctx.logger_thread, NULL);
     bounded_buffer_destroy(&ctx.log_buffer);
+
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+    c = ctx.containers;
+    while (c) {
+        container_record_t *next = c->next;
+        free(c);
+        c = next;
+    }
+    ctx.containers = NULL;
+    pthread_mutex_unlock(&ctx.metadata_lock);
     pthread_mutex_destroy(&ctx.metadata_lock);
-    if(ctx.monitor_fd >= 0) close(ctx.monitor_fd);
-    close(ctx.server_fd);
+
+    /* Step 5: close kernel monitor and control socket. */
+    if (ctx.monitor_fd >= 0) close(ctx.monitor_fd);
+    if (ctx.server_fd >= 0)  close(ctx.server_fd);
     unlink(CONTROL_PATH);
+    fprintf(stderr, "Supervisor exited cleanly.\n");
     return 0;
 }
 
