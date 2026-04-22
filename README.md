@@ -9,7 +9,7 @@ A lightweight Linux container runtime in C with a long-running supervisor and a 
 | Name | SRN |
 |------|-----|
 | Shaurya Singh | PES1UG24CS437 |
-| Sri PPranav Gautam Buduguru | PES1UG24CS466 |
+| Sri Pranav Gautam Buduguru | PES1UG24CS466 |
 
 ---
 
